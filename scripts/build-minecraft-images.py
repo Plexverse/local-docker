@@ -98,6 +98,26 @@ def get_latest_local_engine_release() -> Optional[str]:
         print_error(f"Failed to get latest release: {e}")
         return None
 
+def get_latest_velocity_plugin_release() -> Optional[str]:
+    """Get the latest local-velocity-plugin release JAR URL."""
+    try:
+        response = requests.get(
+            "https://api.github.com/repos/Plexverse/local-velocity-plugin/releases/latest",
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        # Find JAR asset
+        for asset in data.get('assets', []):
+            if asset['name'].endswith('.jar') and 'sources' not in asset['name'] and 'javadoc' not in asset['name']:
+                return asset['browser_download_url']
+        
+        return None
+    except Exception as e:
+        print_error(f"Failed to get latest release: {e}")
+        return None
+
 def download_plugin(lib_name: str, plugins_dir: Path) -> bool:
     """Download a plugin by library name using Modrinth, Spiget API, or direct URLs."""
     # Modrinth project IDs, Spiget API resource IDs, and direct download URLs
@@ -525,7 +545,7 @@ def prompt_for_env_vars(project_name: str, env_keys: List[str]) -> Dict[str, str
     
     return env_vars
 
-def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose_file: Optional[Path] = None):
+def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose_file: Optional[Path] = None, use_swarm: bool = False):
     """Create or update docker-compose.yml file for all projects."""
     # Load existing compose file if it exists
     existing_services = {}
@@ -533,7 +553,7 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
     existing_volumes = {}
     
     # Infrastructure services to preserve (not Minecraft game services)
-    infrastructure_services = {'mongodb', 'kafka', 'kafka-ui', 'zookeeper'}
+    infrastructure_services = {'mongodb', 'kafka', 'kafka-ui', 'zookeeper', 'velocity'}
     
     if base_compose_file and base_compose_file.exists():
         with open(base_compose_file, 'r') as f:
@@ -562,9 +582,10 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
         sanitized_game_name = ''.join(c for c in game_name if c.isalnum() or c in ('-', '_'))
         container_name = f"{sanitized_game_name}-1"
         
-        # Use project ID for service name (for docker-compose service name)
-        sanitized_id = ''.join(c for c in project_id if c.isalnum() or c in ('-', '_')).lower()
-        service_name = sanitized_id
+        # Use lowercased game name for service name (human-readable)
+        # Sanitize game name for service name (alphanumeric, hyphens, underscores only, lowercased)
+        sanitized_game_name_lower = ''.join(c for c in game_name.lower() if c.isalnum() or c in ('-', '_'))
+        service_name = sanitized_game_name_lower
         
         # Use the latest tag (first tag)
         image_tag = project['image_tags'][0] if project['image_tags'] else f"{project['image_name']}:latest"
@@ -581,6 +602,7 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
             'TYPE': 'PAPER',
             'VERSION': '1.21.8',
             'MEMORY': '2G',
+            'ONLINE_MODE': 'FALSE',  # Child servers should not be in online mode
             'DEBUG': 'true',
             'DEBUG_PORT': '5005',
             'GENERATE_STRUCTURES': 'false',
@@ -613,13 +635,110 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
             for key, value in secret_env_vars.items():
                 environment[key] = value
         
-        existing_services[service_name] = {
+        # Use internal networking only - no port publishing
+        # All servers connect through Velocity proxy
+        service_config = {
             'image': image_tag,
-            'ports': [
-                {'target': 25565, 'published': project['port'], 'protocol': 'tcp', 'mode': 'ingress'},
-                {'target': 5005, 'published': debug_port, 'protocol': 'tcp', 'mode': 'ingress'}
-            ],
             'environment': environment,
+            'networks': ['local-docker-network'],
+            'restart': 'on-failure',
+            'labels': {
+                'com.plexverse.project.id': project_id,
+                'com.plexverse.project.name': game_name,
+                'com.plexverse.project.display_name': project.get('display_name', ''),
+                'com.plexverse.project.port': str(project['port']),
+                'com.plexverse.container.name': container_name
+            }
+        }
+        
+        # Add deploy section for Docker Swarm
+        service_config['deploy'] = {
+            'replicas': 1,
+            'restart_policy': {
+                'condition': 'on-failure',
+                'delay': '5s',
+                'max_attempts': 3
+            },
+            'placement': {
+                'constraints': []
+            }
+        }
+        
+        # Add healthcheck that waits for game ready log message
+        service_config['healthcheck'] = {
+            'test': [
+                'CMD-SHELL',
+                'grep -q "Game state is now ready (isReady() = true). Allowing player logins and unregistering ReadyStateModule." /data/logs/latest.log || exit 1'
+            ],
+            'interval': '10s',
+            'timeout': '5s',
+            'retries': 30,
+            'start_period': '60s'
+        }
+        
+        existing_services[service_name] = service_config
+        
+        # Add game properties as labels if available
+        if game_data.get('namespace_id'):
+            existing_services[service_name]['labels']['com.plexverse.namespace.id'] = game_data['namespace_id']
+        if game_data.get('visibility'):
+            existing_services[service_name]['labels']['com.plexverse.game.visibility'] = game_data['visibility']
+        if game_data.get('category'):
+            existing_services[service_name]['labels']['com.plexverse.game.category'] = game_data['category']
+    
+    # Add Velocity proxy service if it doesn't exist
+    if 'velocity' not in existing_services:
+        script_dir = compose_file.parent
+        velocity_dir = script_dir / 'velocity'
+        velocity_dir.mkdir(exist_ok=True)
+        velocity_plugins_dir = velocity_dir / 'plugins'
+        velocity_plugins_dir.mkdir(exist_ok=True)
+        
+        # Download or use local velocity plugin
+        use_local_plugin = getattr(create_docker_compose, '_use_local_velocity_plugin', False)
+        local_plugin_path = getattr(create_docker_compose, '_local_velocity_plugin_path', None)
+        
+        plugin_dest = velocity_plugins_dir / 'velocity-auto-register.jar'
+        
+        if use_local_plugin and local_plugin_path:
+            # Use local plugin
+            local_plugin = Path(local_plugin_path).resolve()
+            if local_plugin.exists():
+                import shutil
+                shutil.copy2(local_plugin, plugin_dest)
+                print_info(f"Using local Velocity plugin: {local_plugin}")
+            else:
+                print_warning(f"Local Velocity plugin path does not exist: {local_plugin}")
+        else:
+            # Download from GitHub
+            print_info("Downloading latest Velocity plugin from GitHub...")
+            plugin_url = get_latest_velocity_plugin_release()
+            if plugin_url:
+                if download_file(plugin_url, plugin_dest):
+                    print_success(f"Downloaded Velocity plugin to {plugin_dest}")
+                else:
+                    print_warning("Failed to download Velocity plugin from GitHub")
+            else:
+                print_warning("Could not get Velocity plugin release URL")
+        
+        existing_services['velocity'] = {
+            'build': {
+                'context': './velocity',
+                'dockerfile': 'Dockerfile'
+            },
+            'image': 'local-velocity:latest',
+            'ports': [
+                {'target': 25565, 'published': 25565, 'protocol': 'tcp', 'mode': 'ingress'}
+            ],
+            'environment': {
+                'VELOCITY_FORWARDING_SECRET': 'local-dev-secret',
+                'VELOCITY_ONLINE_MODE': 'true',
+                'VELOCITY_PORT': '25565'
+            },
+            'volumes': [
+                {'type': 'bind', 'source': './velocity', 'target': '/config'},
+                {'type': 'bind', 'source': '/var/run/docker.sock', 'target': '/var/run/docker.sock', 'read_only': True}
+            ],
             'networks': ['local-docker-network'],
             'deploy': {
                 'replicas': 1,
@@ -633,25 +752,16 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
                 }
             },
             'labels': {
-                'com.plexverse.project.id': project_id,
-                'com.plexverse.project.name': game_name,
-                'com.plexverse.project.display_name': project.get('display_name', ''),
-                'com.plexverse.project.port': str(project['port']),
-                'com.plexverse.container.name': container_name
+                'com.plexverse.service': 'velocity-proxy'
             }
         }
-        
-        # Add game properties as labels if available
-        if game_data.get('namespace_id'):
-            existing_services[service_name]['labels']['com.plexverse.namespace.id'] = game_data['namespace_id']
-        if game_data.get('visibility'):
-            existing_services[service_name]['labels']['com.plexverse.game.visibility'] = game_data['visibility']
-        if game_data.get('category'):
-            existing_services[service_name]['labels']['com.plexverse.game.category'] = game_data['category']
     
     # Ensure network exists (use overlay for Swarm, bridge for single-node)
     if 'local-docker-network' not in existing_networks:
-        existing_networks['local-docker-network'] = {'driver': 'overlay', 'attachable': True}
+        if use_swarm:
+            existing_networks['local-docker-network'] = {'driver': 'overlay', 'attachable': True}
+        else:
+            existing_networks['local-docker-network'] = {'driver': 'bridge'}
     
     compose_data = {
         'version': '3.8',
@@ -694,6 +804,36 @@ def main():
             print_info("Will download latest release from GitHub")
             build_project_image._use_local_jar = False
             build_project_image._local_jar_path = None
+    except (EOFError, KeyboardInterrupt):
+        print_error("\nCancelled")
+        sys.exit(1)
+    
+    # Ask if user wants to use a local velocity plugin JAR
+    print(f"\n{Colors.BLUE}Use local velocity plugin JAR? (leave empty to download from GitHub):{Colors.NC}")
+    local_velocity_plugin_path = None
+    try:
+        local_plugin_input = input("  Local plugin JAR path: ").strip()
+        if local_plugin_input:
+            local_velocity_plugin_path = Path(local_plugin_input).expanduser().resolve()
+            if not local_velocity_plugin_path.exists():
+                print_error(f"Local plugin path does not exist: {local_velocity_plugin_path}")
+                sys.exit(1)
+            if not local_velocity_plugin_path.is_file():
+                print_error(f"Local path is not a file: {local_velocity_plugin_path}")
+                sys.exit(1)
+            if not local_velocity_plugin_path.name.lower().endswith('.jar'):
+                print_warning(f"File does not have .jar extension: {local_velocity_plugin_path}")
+                response = input("  Continue anyway? (y/N): ").strip().lower()
+                if response != 'y':
+                    sys.exit(1)
+            print_success(f"Using local Velocity plugin: {local_velocity_plugin_path}")
+            # Store in function attribute for use in create_docker_compose
+            create_docker_compose._use_local_velocity_plugin = True
+            create_docker_compose._local_velocity_plugin_path = str(local_velocity_plugin_path)
+        else:
+            print_info("Will download latest release from GitHub")
+            create_docker_compose._use_local_velocity_plugin = False
+            create_docker_compose._local_velocity_plugin_path = None
     except (EOFError, KeyboardInterrupt):
         print_error("\nCancelled")
         sys.exit(1)
@@ -759,11 +899,59 @@ def main():
             env_vars = prompt_for_env_vars(project_name, secret_env_keys)
             project['secret_env_vars'] = env_vars
     
+    # Initialize Docker Swarm if not already initialized (for testing)
+    print(f"\n{Colors.BLUE}Initializing Docker Swarm for testing...{Colors.NC}")
+    use_swarm = False
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{.Swarm.LocalNodeState}}"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        swarm_state = result.stdout.strip()
+        if swarm_state == "active":
+            use_swarm = True
+            print_info("Docker Swarm is already active")
+        else:
+            print_info("Initializing Docker Swarm...")
+            subprocess.run(
+                ["docker", "swarm", "init"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            use_swarm = True
+            print_success("Docker Swarm initialized")
+    except subprocess.CalledProcessError as e:
+        print_warning(f"Failed to check/initialize Docker Swarm: {e.stderr}")
+        print_warning("Will use docker-compose mode instead")
+        use_swarm = False
+    except Exception as e:
+        print_warning(f"Error checking Swarm status: {e}")
+        use_swarm = False
+    
     # Create/update docker-compose.yml
     script_dir = Path(__file__).parent.parent
     base_compose_file = script_dir / "docker-compose.yml"
     compose_file = script_dir / "docker-compose.yml"
-    create_docker_compose(results, compose_file, base_compose_file)
+    create_docker_compose(results, compose_file, base_compose_file, use_swarm)
+    
+    # Save project paths mapping for rebuild script
+    project_paths_file = script_dir / ".project-paths.json"
+    project_paths_map = {}
+    for i, project in enumerate(results):
+        project_id = project['project_id']
+        project_path = project_paths[i]
+        project_paths_map[project_id] = {
+            'path': project_path,
+            'project_name': project.get('game_name', project_id),
+            'display_name': project.get('display_name', '')
+        }
+    
+    with open(project_paths_file, 'w') as f:
+        json.dump(project_paths_map, f, indent=2)
+    print_success(f"Saved project paths to {project_paths_file}")
     
     # Print summary
     print(f"\n{Colors.GREEN}Build Summary:{Colors.NC}")
@@ -776,7 +964,8 @@ def main():
             print(f"  {game_name} ({project['project_id']}): {project['image_tags'][0]} (port {project['port']})")
     
     # Initialize Docker Swarm if not already initialized
-    print(f"\n{Colors.BLUE}Initializing Docker Swarm...{Colors.NC}")
+    print(f"\n{Colors.BLUE}Checking Docker Swarm status...{Colors.NC}")
+    use_swarm = False
     try:
         result = subprocess.run(
             ["docker", "info", "--format", "{{.Swarm.LocalNodeState}}"],
@@ -785,7 +974,10 @@ def main():
             check=True
         )
         swarm_state = result.stdout.strip()
-        if swarm_state != "active":
+        if swarm_state == "active":
+            use_swarm = True
+            print_info("Docker Swarm is active")
+        else:
             print_info("Initializing Docker Swarm...")
             subprocess.run(
                 ["docker", "swarm", "init"],
@@ -793,39 +985,73 @@ def main():
                 capture_output=True,
                 text=True
             )
+            use_swarm = True
             print_success("Docker Swarm initialized")
-        else:
-            print_info("Docker Swarm already active")
     except subprocess.CalledProcessError as e:
         print_warning(f"Failed to check/initialize Docker Swarm: {e.stderr}")
-        print_warning("Attempting to continue anyway...")
+        print_warning("Will use docker-compose mode instead")
+        use_swarm = False
+    except Exception as e:
+        print_warning(f"Error checking Swarm status: {e}")
+        use_swarm = False
     
-    # Ask if user wants to start services
-    stack_name = "local-docker"
-    print(f"\n{Colors.BLUE}Deploying Docker Stack '{stack_name}'...{Colors.NC}")
-    try:
-        result = subprocess.run(
-            ["docker", "stack", "deploy", "-c", str(compose_file), stack_name],
-            cwd=script_dir,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        print_success(f"Docker Stack '{stack_name}' deployed")
-        print(f"\n{Colors.GREEN}Services are running:{Colors.NC}")
-        for project in results:
-            game_name = project.get('game_name', project['project_id'])
-            display_name = project.get('display_name', '')
-            name_display = display_name if display_name else game_name
-            print(f"  {name_display} ({project['project_id']}): localhost:{project['port']}")
-        print(f"\n{Colors.YELLOW}To view stack services:{Colors.NC}")
-        print(f"  docker stack services {stack_name}")
-        print(f"\n{Colors.YELLOW}To remove the stack:{Colors.NC}")
-        print(f"  docker stack rm {stack_name}")
-    except subprocess.CalledProcessError as e:
-        print_error(f"Failed to deploy Docker Stack: {e.stderr}")
-        print(f"\n{Colors.YELLOW}You can deploy manually with:{Colors.NC}")
-        print(f"  docker stack deploy -c {compose_file} {stack_name}")
+    if use_swarm:
+        # Deploy using Docker Swarm
+        stack_name = "local-docker"
+        print(f"\n{Colors.BLUE}Deploying Docker Stack '{stack_name}'...{Colors.NC}")
+        try:
+            result = subprocess.run(
+                ["docker", "stack", "deploy", "-c", str(compose_file), stack_name],
+                cwd=script_dir,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print_success(f"Docker Stack '{stack_name}' deployed")
+            print(f"\n{Colors.GREEN}Services are running:{Colors.NC}")
+            for project in results:
+                game_name = project.get('game_name', project['project_id'])
+                display_name = project.get('display_name', '')
+                name_display = display_name if display_name else game_name
+                print(f"  {name_display} ({project['project_id']}): Connect via Velocity proxy on localhost:25565")
+            print(f"\n{Colors.YELLOW}To view stack services:{Colors.NC}")
+            print(f"  docker stack services {stack_name}")
+            print(f"\n{Colors.YELLOW}To remove the stack:{Colors.NC}")
+            print(f"  docker stack rm {stack_name}")
+        except subprocess.CalledProcessError as e:
+            print_error(f"Failed to deploy Docker Stack: {e.stderr}")
+            print(f"\n{Colors.YELLOW}You can deploy manually with:{Colors.NC}")
+            print(f"  docker stack deploy -c {compose_file} {stack_name}")
+    else:
+        # Deploy using docker-compose (local mode)
+        print(f"\n{Colors.BLUE}Starting services with docker-compose...{Colors.NC}")
+        try:
+            # Stop any existing services first
+            subprocess.run(
+                ["docker-compose", "-f", str(compose_file), "down"],
+                cwd=script_dir,
+                capture_output=True
+            )
+            
+            # Start services
+            result = subprocess.run(
+                ["docker-compose", "-f", str(compose_file), "up", "-d"],
+                cwd=script_dir,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print_success("Services started with docker-compose")
+            print(f"\n{Colors.GREEN}Services are running:{Colors.NC}")
+            print(f"  Connect via Velocity proxy on localhost:25565")
+            print(f"\n{Colors.YELLOW}To view services:{Colors.NC}")
+            print(f"  docker-compose -f {compose_file} ps")
+            print(f"\n{Colors.YELLOW}To stop services:{Colors.NC}")
+            print(f"  docker-compose -f {compose_file} down")
+        except subprocess.CalledProcessError as e:
+            print_error(f"Failed to start services: {e.stderr}")
+            print(f"\n{Colors.YELLOW}You can start manually with:{Colors.NC}")
+            print(f"  docker-compose -f {compose_file} up -d")
 
 if __name__ == "__main__":
     main()

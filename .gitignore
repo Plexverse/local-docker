@@ -1,1 +1,7 @@
 /scripts/__pycache__
+/velocity/plugins/*.jar
+/velocity/logs/
+/velocity/lang/
+/velocity/plugins/bStats/
+.project-paths.json
+/velocity/forwarding.secret
