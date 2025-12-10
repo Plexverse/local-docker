@@ -1,0 +1,114 @@
+version: '3.8'
+services:
+  mongodb:
+    image: mongo:7.0
+    ports:
+    - target: 27017
+      published: 27017
+      protocol: tcp
+    environment:
+      MONGO_INITDB_DATABASE: mineplex
+    volumes:
+    - mongodb_data:/data/db
+    healthcheck:
+      test:
+      - CMD
+      - mongosh
+      - --eval
+      - db.adminCommand('ping')
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      local-docker-network:
+        aliases:
+        - mongo
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+    - local-docker-network
+    healthcheck:
+      test:
+      - CMD
+      - nc
+      - -z
+      - localhost
+      - '2181'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    ports:
+    - target: 9092
+      published: 9092
+      protocol: tcp
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: 18000
+      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: 18000
+    networks:
+      local-docker-network:
+        aliases:
+        - kafka
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+    - target: 8080
+      published: 8080
+      protocol: tcp
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local-kafka
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+    - local-docker-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+networks:
+  local-docker-network:
+    driver: overlay
+    attachable: true
+volumes:
+  mongodb_data: null
