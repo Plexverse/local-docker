@@ -56,6 +56,75 @@ All Minecraft servers are accessible through the Velocity proxy:
 
 The Velocity proxy automatically forwards players to the correct backend server based on the server name. Each replica of a service is registered as a separate server (e.g., `gamename-1`, `gamename-2`, etc.).
 
+## Rebuilding Docker Instances
+
+When you make changes to your Minecraft project code, you need to rebuild the Docker images and redeploy the services.
+
+### Full Rebuild (Recommended)
+
+The recommended way is to run the full build script again, which will rebuild all images:
+
+```bash
+python3 scripts/build-minecraft-images.py
+```
+
+This will:
+- Rebuild Docker images for all projects
+- Update the docker-compose.yml
+- Redeploy the stack/compose
+
+### Quick Rebuild Script
+
+For a quicker rebuild and redeploy of existing instances, use the rebuild script:
+
+```bash
+python3 scripts/rebuild-minecraft-instances.py
+```
+
+This script:
+- Loads saved project paths from `.project-paths.json`
+- Rebuilds Docker images for all Minecraft services with your latest code changes
+- Redeploys the stack/compose with updated images
+
+> [!NOTE]
+> The rebuild script requires that you've run the full build script at least once to save project paths. It will rebuild all images from the saved project paths, so make sure your code changes are in those project directories.
+
+### Manual Rebuild
+
+You can also manually rebuild and redeploy:
+
+#### Using Docker Swarm:
+
+```bash
+# Rebuild a specific service image (requires project path)
+# First, rebuild the image using the build script, then:
+docker service update --force local-docker_<service-name>
+```
+
+#### Using docker-compose:
+
+```bash
+# Rebuild and restart a specific service
+docker-compose -f docker-compose.yml up -d --build <service-name>
+
+# Rebuild and restart all services
+docker-compose -f docker-compose.yml up -d --build
+```
+
+### Rebuilding After Code Changes
+
+1. **Make your code changes** in the project directory
+2. **Run the build script:**
+   ```bash
+   python3 scripts/build-minecraft-images.py
+   ```
+3. **The script will:**
+   - Detect the project paths from docker-compose.yml (or prompt you)
+   - Rebuild the Docker images with your changes
+   - Update and redeploy the services
+
+The build script uses `--no-cache` by default to ensure fresh builds with your latest code changes.
+
 ## Scaling Game Server Instances
 
 To increase the number of instances for a game server:
@@ -167,7 +236,9 @@ docker ps | grep <service-name>
 docker inspect <container-id> | grep IPAddress
 
 # Connect to the debug port using the container IP
-# Note: This only works if the debug port is accessible within the Docker network
+
+> [!NOTE]
+> This only works if the debug port is accessible within the Docker network
 ```
 
 #### Method 3: Publish Debug Port (Temporary)
@@ -189,7 +260,8 @@ docker service update --publish-add 5005:5005 local-docker_<service-name>
 docker-compose -f docker-compose.yml up -d <service-name>
 ```
 
-**Note:** Remember to remove the published port after debugging to keep servers internal-only.
+> [!NOTE]
+> Remember to remove the published port after debugging to keep servers internal-only.
 
 ### IDE Configuration
 
@@ -218,66 +290,3 @@ Configure your IDE to connect to the debug port:
   1. Run → Debug Configurations
   2. Remote Java Application → New
   3. Host: `localhost`, Port: `5005`
-
-## Rebuilding Docker Instances
-
-When you make changes to your Minecraft project code, you need to rebuild the Docker images and redeploy the services.
-
-### Full Rebuild (Recommended)
-
-The recommended way is to run the full build script again, which will rebuild all images:
-
-```bash
-python3 scripts/build-minecraft-images.py
-```
-
-This will:
-- Rebuild Docker images for all projects
-- Update the docker-compose.yml
-- Redeploy the stack/compose
-
-### Quick Rebuild Script
-
-For a quicker rebuild and redeploy of existing instances (without rebuilding images), use the rebuild script:
-
-```bash
-python3 scripts/rebuild-minecraft-instances.py
-```
-
-**Note:** This script redeploys services but doesn't rebuild images. To rebuild images with code changes, you must run the full build script.
-
-### Manual Rebuild
-
-You can also manually rebuild and redeploy:
-
-#### Using Docker Swarm:
-
-```bash
-# Rebuild a specific service image (requires project path)
-# First, rebuild the image using the build script, then:
-docker service update --force local-docker_<service-name>
-```
-
-#### Using docker-compose:
-
-```bash
-# Rebuild and restart a specific service
-docker-compose -f docker-compose.yml up -d --build <service-name>
-
-# Rebuild and restart all services
-docker-compose -f docker-compose.yml up -d --build
-```
-
-### Rebuilding After Code Changes
-
-1. **Make your code changes** in the project directory
-2. **Run the build script:**
-   ```bash
-   python3 scripts/build-minecraft-images.py
-   ```
-3. **The script will:**
-   - Detect the project paths from docker-compose.yml (or prompt you)
-   - Rebuild the Docker images with your changes
-   - Update and redeploy the services
-
-The build script uses `--no-cache` by default to ensure fresh builds with your latest code changes.
