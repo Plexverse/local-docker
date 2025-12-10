@@ -1,4 +1,21 @@
 <img width="4096" height="843" alt="Github Repository Header" src="https://github.com/user-attachments/assets/2ec10054-b063-441a-b6de-65f3c374ef98" />
+</br>
+</br>
+
+Local Docker development environment for Mineplex game servers with Velocity proxy, auto-registration, and health checks.
+
+## Features
+
+- **Automated Docker Image Building**: Build Docker images for multiple Minecraft game projects in parallel
+- **Velocity Proxy Integration**: Automatic server discovery and registration via Velocity proxy on port 25565
+- **Docker Swarm & Compose Support**: Works with both Docker Swarm and docker-compose for flexible deployment
+- **Auto-Registration Plugin**: Automatically discovers and registers game servers using Docker socket API
+- **Health Checks**: Servers only become available when fully ready (monitors game state readiness)
+- **Internal Networking**: All game servers use internal networking only - no port conflicts when scaling
+- **Easy Scaling**: Scale game server instances up or down without manual configuration
+- **Debug Port Support**: Remote debugging support on port 5005 for each server instance
+- **Quick Rebuild Script**: Rebuild and redeploy all instances with a single command
+- **Project Path Persistence**: Saves project paths for quick rebuilds without re-entering paths
 
 ## Using the Build Script
 
@@ -35,7 +52,7 @@ The script will:
 All Minecraft servers are accessible through the Velocity proxy:
 
 - **Proxy Address:** `localhost:25565`
-- **Server Names:** Use the lowercased game name with replica number (e.g., `micro-battles-1`, `micro-battles-2`, `marketplace-1`)
+- **Server Names:** Use the lowercased game name with replica number (e.g., `micro-battles-1`, `micro-battles-2`, `skywars-1`)
 
 The Velocity proxy automatically forwards players to the correct backend server based on the server name. Each replica of a service is registered as a separate server (e.g., `gamename-1`, `gamename-2`, etc.).
 
