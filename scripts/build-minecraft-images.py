@@ -135,6 +135,10 @@ def download_plugin(lib_name: str, plugins_dir: Path) -> bool:
             'spiget_id': '96927',  # DecentHolograms resource ID
             'fallback': 'https://github.com/Andre601/DecentHolograms/releases/latest/download/DecentHolograms.jar'
         },
+        'FLOODGATE': {
+            'modrinth_id': 'floodgate',  # Floodgate on Modrinth
+            'fallback': 'https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot'
+        },
     }
     
     if lib_name not in plugin_configs:
@@ -145,8 +149,8 @@ def download_plugin(lib_name: str, plugins_dir: Path) -> bool:
     dest = plugins_dir / f"{lib_name}.jar"
     print_info(f"  Downloading {lib_name}...")
     
-    # Try Modrinth API first (for ProtocolLib)
-    if lib_name == 'PROTOCOLLIB' and config.get('modrinth_id'):
+    # Try Modrinth API first (for ProtocolLib, Floodgate, etc.)
+    if config.get('modrinth_id'):
         try:
             # Get latest version from Modrinth
             modrinth_api = f"https://api.modrinth.com/v2/project/{config['modrinth_id']}/version"
@@ -154,19 +158,34 @@ def download_plugin(lib_name: str, plugins_dir: Path) -> bool:
             if response.status_code == 200:
                 versions = response.json()
                 if versions:
-                    # Find the latest version for Minecraft 1.21
+                    # Find the latest version for Minecraft 1.21 (or latest for Floodgate)
                     for version in versions:
                         game_versions = version.get('game_versions', [])
-                        if '1.21' in game_versions or '1.21.1' in game_versions:
+                        # For Floodgate, accept any version; for others, check for 1.21
+                        if lib_name == 'FLOODGATE' or '1.21' in game_versions or '1.21.1' in game_versions:
                             files = version.get('files', [])
                             if files:
-                                download_url = files[0].get('url')
-                                if download_url and download_file(download_url, dest):
-                                    if dest.stat().st_size > 100000:  # > 100KB
-                                        print_success(f"  Downloaded {lib_name} from Modrinth")
-                                        return True
-                                    else:
-                                        dest.unlink()
+                                # For Floodgate, find the spigot/paper JAR
+                                if lib_name == 'FLOODGATE':
+                                    for file_info in files:
+                                        filename = file_info.get('filename', '').lower()
+                                        if 'spigot' in filename or 'paper' in filename:
+                                            download_url = file_info.get('url')
+                                            if download_url and download_file(download_url, dest):
+                                                if dest.stat().st_size > 100000:  # > 100KB
+                                                    print_success(f"  Downloaded {lib_name} from Modrinth")
+                                                    return True
+                                                else:
+                                                    dest.unlink()
+                                else:
+                                    # For other plugins, use first file
+                                    download_url = files[0].get('url')
+                                    if download_url and download_file(download_url, dest):
+                                        if dest.stat().st_size > 100000:  # > 100KB
+                                            print_success(f"  Downloaded {lib_name} from Modrinth")
+                                            return True
+                                        else:
+                                            dest.unlink()
         except Exception as e:
             print_warning(f"  Modrinth download failed: {e}")
     
@@ -408,6 +427,10 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
             print_info(f"Downloading {len(libraries)} dependencies...")
             for lib in libraries:
                 download_plugin(lib, plugins_dir)
+        
+        # 3.5. Always download Floodgate for Bedrock support
+        print_info("Downloading Floodgate for Bedrock support...")
+        download_plugin('FLOODGATE', plugins_dir)
         
         # 4. Copy external-plugins to plugins directory
         # Skip engine-bridge JARs since we already handled them in step 1
@@ -776,6 +799,103 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
             else:
                 print_warning("Could not get Velocity plugin release URL")
         
+        # Download Geyser for Velocity (Bedrock support)
+        print_info("Downloading Geyser for Velocity (Bedrock support)...")
+        geyser_dest = velocity_plugins_dir / 'Geyser-Velocity.jar'
+        geyser_downloaded = False
+        
+        # Try Modrinth API for Geyser-Velocity
+        try:
+            modrinth_api = "https://api.modrinth.com/v2/project/geyser/version"
+            response = requests.get(modrinth_api, timeout=10)
+            if response.status_code == 200:
+                versions = response.json()
+                if versions:
+                    # Find the latest version for Velocity
+                    for version in versions:
+                        loaders = version.get('loaders', [])
+                        if 'velocity' in loaders:
+                            files = version.get('files', [])
+                            # Find the Velocity JAR file
+                            for file_info in files:
+                                if 'velocity' in file_info.get('filename', '').lower():
+                                    download_url = file_info.get('url')
+                                    if download_url and download_file(download_url, geyser_dest):
+                                        if geyser_dest.stat().st_size > 100000:  # > 100KB
+                                            print_success(f"Downloaded Geyser-Velocity from Modrinth")
+                                            geyser_downloaded = True
+                                            break
+                            if geyser_downloaded:
+                                break
+        except Exception as e:
+            print_warning(f"Modrinth download failed: {e}")
+        
+        # Fallback to direct download URL
+        if not geyser_downloaded:
+            geyser_fallback = "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity"
+            if download_file(geyser_fallback, geyser_dest):
+                if geyser_dest.stat().st_size > 100000:  # > 100KB
+                    print_success(f"Downloaded Geyser-Velocity from fallback URL")
+                else:
+                    geyser_dest.unlink()
+                    print_warning("Downloaded Geyser file too small, may be invalid")
+            else:
+                    print_warning("Failed to download Geyser-Velocity")
+    
+    # Always ensure Geyser is downloaded (even if velocity service exists)
+    script_dir = compose_file.parent
+    velocity_dir = script_dir / 'velocity'
+    velocity_plugins_dir = velocity_dir / 'plugins'
+    velocity_plugins_dir.mkdir(exist_ok=True)
+    geyser_dest = velocity_plugins_dir / 'Geyser-Velocity.jar'
+    
+    # Only download if it doesn't exist
+    if not geyser_dest.exists():
+        print_info("Downloading Geyser for Velocity (Bedrock support)...")
+        geyser_downloaded = False
+        
+        # Try Modrinth API for Geyser-Velocity
+        try:
+            modrinth_api = "https://api.modrinth.com/v2/project/geyser/version"
+            response = requests.get(modrinth_api, timeout=10)
+            if response.status_code == 200:
+                versions = response.json()
+                if versions:
+                    # Find the latest version for Velocity
+                    for version in versions:
+                        loaders = version.get('loaders', [])
+                        if 'velocity' in loaders:
+                            files = version.get('files', [])
+                            # Find the Velocity JAR file
+                            for file_info in files:
+                                if 'velocity' in file_info.get('filename', '').lower():
+                                    download_url = file_info.get('url')
+                                    if download_url and download_file(download_url, geyser_dest):
+                                        if geyser_dest.stat().st_size > 100000:  # > 100KB
+                                            print_success(f"Downloaded Geyser-Velocity from Modrinth")
+                                            geyser_downloaded = True
+                                            break
+                            if geyser_downloaded:
+                                break
+        except Exception as e:
+            print_warning(f"Modrinth download failed: {e}")
+        
+        # Fallback to direct download URL
+        if not geyser_downloaded:
+            geyser_fallback = "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/velocity"
+            if download_file(geyser_fallback, geyser_dest):
+                if geyser_dest.stat().st_size > 100000:  # > 100KB
+                    print_success(f"Downloaded Geyser-Velocity from fallback URL")
+                else:
+                    geyser_dest.unlink()
+                    print_warning("Downloaded Geyser file too small, may be invalid")
+            else:
+                print_warning("Failed to download Geyser-Velocity")
+    else:
+        print_info("Geyser-Velocity already exists, skipping download")
+    
+    # Ensure velocity service exists (create if it doesn't)
+    if 'velocity' not in existing_services:
         existing_services['velocity'] = {
             'build': {
                 'context': './velocity',
