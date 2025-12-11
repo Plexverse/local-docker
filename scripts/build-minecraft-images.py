@@ -344,8 +344,8 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
         plugins_dir = build_dir / "plugins"
         plugins_dir.mkdir(parents=True)
         
-        # 1. Get local-engine JAR (local path or download)
-        local_engine_jar = plugins_dir / "local-engine.jar"
+        # 1. Get engine-bridge JAR (local path, from build, or download)
+        engine_bridge_jar = plugins_dir / "engine-bridge.jar"
         
         # Check if we should use a local JAR (shared across all projects)
         # This is handled at the main() level, but we check here too for per-project override
@@ -356,7 +356,7 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
             # Resolve path relative to script's parent directory (workspace root)
             script_dir = Path(__file__).parent.parent
             local_jar = (script_dir / local_jar_path).resolve()
-            print_info(f"Using local local-engine JAR: {local_jar}")
+            print_info(f"Using local engine-bridge JAR: {local_jar}")
             if not local_jar.exists():
                 print_error(f"Local JAR path does not exist: {local_jar}")
                 return None
@@ -364,21 +364,35 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
                 print_error(f"Local path is not a JAR file: {local_jar}")
                 return None
             # Copy with timestamp to ensure Docker sees it as changed
-            shutil.copy2(local_jar, local_engine_jar)
+            shutil.copy2(local_jar, engine_bridge_jar)
             # Touch the file to update its timestamp
-            local_engine_jar.touch()
-            print_success(f"Copied local-engine.jar from {local_jar} (size: {local_jar.stat().st_size} bytes)")
+            engine_bridge_jar.touch()
+            print_success(f"Copied engine-bridge.jar from {local_jar} (size: {local_jar.stat().st_size} bytes)")
         else:
-            print_info(f"Downloading local-engine for {game_name}...")
-            jar_url = get_latest_local_engine_release()
-            if not jar_url:
-                print_error("Could not get local-engine release URL")
-                return None
+            # Try to use engine-bridge from ../engine-bridge/build/libs first
+            script_dir = Path(__file__).parent.parent
+            engine_bridge_dir = script_dir.parent / "engine-bridge" / "build" / "libs"
+            engine_bridge_files = list(engine_bridge_dir.glob("engine-bridge-*-all-local.jar")) if engine_bridge_dir.exists() else []
             
-            if not download_file(jar_url, local_engine_jar):
-                print_error("Failed to download local-engine")
-                return None
-            print_success(f"Downloaded local-engine.jar")
+            if engine_bridge_files:
+                # Use the most recent engine-bridge JAR
+                local_jar = max(engine_bridge_files, key=lambda p: p.stat().st_mtime)
+                print_info(f"Using engine-bridge JAR from build: {local_jar}")
+                shutil.copy2(local_jar, engine_bridge_jar)
+                engine_bridge_jar.touch()
+                print_success(f"Copied engine-bridge.jar from {local_jar} (size: {local_jar.stat().st_size} bytes)")
+            else:
+                # Fallback: download from GitHub (local-engine repo)
+                print_info(f"Downloading engine-bridge (local-engine) for {game_name}...")
+                jar_url = get_latest_local_engine_release()
+                if not jar_url:
+                    print_error("Could not get local-engine release URL")
+                    return None
+                
+                if not download_file(jar_url, engine_bridge_jar):
+                    print_error("Failed to download engine-bridge")
+                    return None
+                print_success(f"Downloaded engine-bridge.jar")
         
         # 2. Build project JAR
         built_jar = build_project_jar(project_dir)
@@ -396,9 +410,14 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
                 download_plugin(lib, plugins_dir)
         
         # 4. Copy external-plugins to plugins directory
+        # Skip engine-bridge JARs since we already handled them in step 1
         external_plugins_dir = project_dir / "external-plugins"
         if external_plugins_dir.exists() and external_plugins_dir.is_dir():
             for plugin_file in external_plugins_dir.glob("*.jar"):
+                # Skip engine-bridge JARs to avoid duplicates
+                if plugin_file.name.startswith("engine-bridge") or plugin_file.name.startswith("local-engine"):
+                    print_info(f"Skipping {plugin_file.name} (already handled by engine-bridge step)")
+                    continue
                 shutil.copy2(plugin_file, plugins_dir / plugin_file.name)
                 print_success(f"Copied external plugin: {plugin_file.name}")
         
@@ -407,9 +426,44 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
             shutil.copytree(project_dir / "assets", build_dir / "assets")
             print_success("Copied assets directory")
         
+        # Ensure config directory exists
+        config_dir = build_dir / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy project config if it exists
         if (project_dir / "config").exists():
-            shutil.copytree(project_dir / "config", build_dir / "config")
+            shutil.copytree(project_dir / "config", build_dir / "config", dirs_exist_ok=True)
             print_success("Copied config directory")
+        
+        # 5.5. Create/update paper-global.yml with Velocity forwarding configuration
+        # This file goes in /data/config/paper-global.yml in the container
+        paper_global_yml = config_dir / "paper-global.yml"
+        
+        # Read existing paper-global.yml if it exists, otherwise create new one
+        paper_config = {}
+        if paper_global_yml.exists():
+            try:
+                with open(paper_global_yml, 'r') as f:
+                    paper_config = yaml.safe_load(f) or {}
+            except Exception as e:
+                print_warning(f"Failed to parse existing paper-global.yml: {e}")
+                paper_config = {}
+        
+        # Ensure proxies section exists
+        if 'proxies' not in paper_config:
+            paper_config['proxies'] = {}
+        
+        # Configure Velocity forwarding
+        paper_config['proxies']['velocity'] = {
+            'enabled': True,
+            'online-mode': True,
+            'secret': 'local-dev-secret'
+        }
+        
+        # Write the updated config
+        with open(paper_global_yml, 'w') as f:
+            yaml.dump(paper_config, f, default_flow_style=False, sort_keys=False)
+        print_success("Configured Velocity forwarding in paper-global.yml")
         
         # 5.5. Create .mineplex-common-name file
         server_dir = build_dir / "server"
@@ -437,7 +491,8 @@ def build_project_image(project_path: str, port: int = 25565) -> Optional[Dict]:
             f.write("ENV ALLOW_FLIGHT=true\n")
             f.write("ENV SPAWN_PROTECTION=0\n")
             f.write("ENV LEVEL_TYPE=FLAT\n")
-            f.write("ENV LEVEL_TYPE_FLAT_GENERATOR_SETTINGS={}\n\n")
+            f.write("ENV LEVEL_TYPE_FLAT_GENERATOR_SETTINGS={}\n")
+            f.write("\n")
             f.write("# Copy plugins and set permissions\n")
             f.write("COPY --chown=1000:1000 plugins/ /data/plugins/\n\n")
             
@@ -779,7 +834,7 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
 
 def main():
     # Ask if user wants to use a local local-engine JAR
-    print(f"{Colors.BLUE}Use local local-engine JAR? (leave empty to download from GitHub):{Colors.NC}")
+    print(f"{Colors.BLUE}Use local engine-bridge JAR? (leave empty to use from build/libs or download):{Colors.NC}")
     local_jar_path = None
     try:
         local_path_input = input("  Local JAR path: ").strip()
