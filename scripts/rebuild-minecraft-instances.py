@@ -16,6 +16,7 @@ import subprocess
 import json
 import yaml
 from pathlib import Path
+from typing import List, Dict, Optional
 
 # Colors for output
 class Colors:
@@ -166,7 +167,7 @@ def rebuild_image(service_info: dict, project_path: str, script_dir: Path):
         traceback.print_exc()
         return False
 
-def redeploy_stack(compose_file: Path, use_swarm: bool, stack_name: str = "local-docker"):
+def redeploy_stack(compose_file: Path, use_swarm: bool, stack_name: str = "local-docker", minecraft_services: List[Dict] = None):
     """Redeploy the Docker stack or compose."""
     script_dir = compose_file.parent
     
@@ -181,6 +182,25 @@ def redeploy_stack(compose_file: Path, use_swarm: bool, stack_name: str = "local
                 text=True
             )
             print_success(f"Docker Stack '{stack_name}' redeployed")
+            
+            # Force update services to use new images (Docker Swarm doesn't restart services automatically)
+            if minecraft_services:
+                print_info("Forcing service updates to use new images...")
+                for service_info in minecraft_services:
+                    service_name = service_info['name']
+                    full_service_name = f"{stack_name}_{service_name}"
+                    try:
+                        subprocess.run(
+                            ["docker", "service", "update", "--force", full_service_name],
+                            cwd=script_dir,
+                            check=True,
+                            capture_output=True,
+                            text=True
+                        )
+                        print_success(f"Updated service: {service_name}")
+                    except subprocess.CalledProcessError as e:
+                        print_warning(f"Failed to update service {service_name}: {e.stderr}")
+            
             return True
         except subprocess.CalledProcessError as e:
             print_error(f"Failed to redeploy Docker Stack: {e.stderr}")
@@ -260,7 +280,7 @@ def main():
     
     # Redeploy the stack/compose
     print_info("Redeploying services...")
-    if redeploy_stack(compose_file, use_swarm):
+    if redeploy_stack(compose_file, use_swarm, minecraft_services=minecraft_services):
         print_success("Rebuild and redeployment complete!")
         print_info("Services should be restarting with updated images")
     else:

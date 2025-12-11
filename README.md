@@ -47,6 +47,25 @@ The script will:
 - Set up a Velocity proxy on port 25565 (default Minecraft port)
 - Automatically register all servers with Velocity via the auto-registration plugin using Docker socket API
 
+## Running Minecraft Commands
+
+You can easily run Minecraft commands in your server containers using the `mc-command.py` script:
+
+```bash
+# Interactive mode - select server from list
+python3 scripts/mc-command.py
+
+# Interactive mode for specific service (e.g., micro-battles)
+python3 scripts/mc-command.py micro-battles
+
+# Run a single command (no quotes needed!)
+python3 scripts/mc-command.py micro-battles say Hello World
+python3 scripts/mc-command.py micro-battles list
+python3 scripts/mc-command.py micro-battles help
+```
+
+The script automatically detects whether you're using Docker Swarm or Docker Compose and finds the correct containers. Commands are sent via RCON (enabled on port 25575 by default).
+
 ## Connecting to Servers
 
 All Minecraft servers are accessible through the Velocity proxy:
@@ -199,9 +218,9 @@ The plugin uses the Docker socket mounted in the Velocity container, so no manua
 
 After scaling, connect to `localhost:25565` and use `/server <server-name>` to connect to specific replicas (e.g., `/server micro-battles-1`, `/server micro-battles-2`).
 
-The plugin is automatically downloaded from GitHub (Plexverse/local-velocity-plugin) when you run the build script. You can optionally provide a local path to use a custom build instead.
+The plugin is automatically downloaded from GitHub ([Plexverse/local-velocity-plugin](https://github.com/Plexverse/local-velocity-plugin)) when you run the build script. You can optionally provide a local path to use a custom build instead.
 
-For more information about the plugin, see [local-velocity-plugin](../local-velocity-plugin/README.md).
+For more information about the plugin, see [local-velocity-plugin](https://github.com/Plexverse/local-velocity-plugin).
 
 ## Debugging Minecraft Servers
 
