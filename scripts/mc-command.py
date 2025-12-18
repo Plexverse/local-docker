@@ -80,12 +80,19 @@ def get_minecraft_containers(use_swarm: bool) -> List[Tuple[str, str]]:
             )
             services = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
             
-            # Filter for local-docker services and exclude infrastructure
+            # Filter for local-docker services and exclude infrastructure and database services
+            excluded_services = {
+                'local-docker_velocity', 'local-docker_mongodb', 'local-docker_kafka', 
+                'local-docker_zookeeper', 'local-docker_kafka-ui'
+            }
+            
             minecraft_services = [
                 s for s in services 
                 if s.startswith('local-docker_') 
-                and s not in ['local-docker_velocity', 'local-docker_mongodb', 'local-docker_kafka', 
-                              'local-docker_zookeeper', 'local-docker_kafka-ui']
+                and s not in excluded_services
+                and not s.startswith('local-docker_mongo-')  # Exclude dynamic MongoDB services
+                and not s.startswith('local-docker_postgres-')  # Exclude dynamic PostgreSQL services
+                and not s.startswith('local-docker_mysql-')  # Exclude dynamic MySQL services
             ]
             
             # Get container names for each service
@@ -143,12 +150,23 @@ def get_minecraft_containers(use_swarm: bool) -> List[Tuple[str, str]]:
                 parts = line.strip().split('\t')
                 if len(parts) == 2:
                     container_name, image = parts
-                    # Filter for Minecraft containers (exclude infrastructure)
+                    # Filter for Minecraft containers (exclude infrastructure and database services)
+                    excluded_containers = {
+                        'local-docker_velocity', 'local-docker_mongodb', 
+                        'local-docker_kafka', 'local-docker_zookeeper', 
+                        'local-docker_kafka-ui'
+                    }
+                    
+                    is_excluded = (
+                        container_name in excluded_containers or
+                        container_name.startswith('local-docker_mongo-') or
+                        container_name.startswith('local-docker_postgres-') or
+                        container_name.startswith('local-docker_mysql-')
+                    )
+                    
                     if (container_name.startswith('local-docker_') and 
-                        container_name not in ['local-docker_velocity', 'local-docker_mongodb', 
-                                              'local-docker_kafka', 'local-docker_zookeeper', 
-                                              'local-docker_kafka-ui'] and
-                        'minecraft' in image.lower() or 'local-' in image.lower()):
+                        not is_excluded and
+                        ('minecraft' in image.lower() or 'local-' in image.lower())):
                         # Extract service name
                         service_name = container_name.replace('local-docker_', '').split('_')[0]
                         containers.append((container_name, service_name))
@@ -228,23 +246,28 @@ def interactive_mode(container_name: Optional[str] = None, service_name: Optiona
         for i, (cont_name, serv_name) in enumerate(containers, 1):
             print(f"  {i}. {serv_name} ({cont_name})")
         
-        while True:
-            try:
-                choice = input(f"\nSelect server (1-{len(containers)}) or 'q' to quit: ").strip()
-                if choice.lower() == 'q':
+        # Auto-select if only one server
+        if len(containers) == 1:
+            container_name, service_name = containers[0]
+            print_info(f"Auto-selected: {service_name} (only server available)")
+        else:
+            while True:
+                try:
+                    choice = input(f"\nSelect server (1-{len(containers)}) or 'q' to quit: ").strip()
+                    if choice.lower() == 'q':
+                        sys.exit(0)
+                    
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(containers):
+                        container_name, service_name = containers[idx]
+                        break
+                    else:
+                        print_error(f"Invalid choice. Please enter a number between 1 and {len(containers)}")
+                except ValueError:
+                    print_error("Invalid input. Please enter a number or 'q' to quit")
+                except KeyboardInterrupt:
+                    print("\n")
                     sys.exit(0)
-                
-                idx = int(choice) - 1
-                if 0 <= idx < len(containers):
-                    container_name, service_name = containers[idx]
-                    break
-                else:
-                    print_error(f"Invalid choice. Please enter a number between 1 and {len(containers)}")
-            except ValueError:
-                print_error("Invalid input. Please enter a number or 'q' to quit")
-            except KeyboardInterrupt:
-                print("\n")
-                sys.exit(0)
     
     print_success(f"Connected to {service_name or container_name}")
     print_info("Enter Minecraft commands (or 'exit'/'quit' to exit):")
