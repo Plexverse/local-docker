@@ -623,7 +623,79 @@ def prompt_for_env_vars(project_name: str, env_keys: List[str]) -> Dict[str, str
     
     return env_vars
 
-def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose_file: Optional[Path] = None, use_swarm: bool = False):
+# Static credentials as defined in ManagedDBModuleImpl
+DB_USERNAME = "local-engine"
+DB_PASSWORD = "local-engine"
+
+def create_databases_from_configs(project_paths: List[str]):
+    """Scan for config/databases folders in project directories and return database configs."""
+    print_info("Scanning for database configurations...")
+    
+    databases_created = []
+    seen_database_names = set()  # Track seen database names to deduplicate
+    
+    # First pass: collect all database configurations
+    for project_path_str in project_paths:
+        project_dir = Path(project_path_str).expanduser().resolve()
+        databases_dir = project_dir / "config" / "databases"
+        
+        if not databases_dir.exists() or not databases_dir.is_dir():
+            continue
+        
+        print_info(f"Scanning {project_dir.name}/config/databases...")
+        
+        # Find all YAML files in the databases directory
+        yaml_files = list(databases_dir.glob("*.yaml")) + list(databases_dir.glob("*.yml"))
+        
+        for yaml_file in yaml_files:
+            try:
+                with open(yaml_file, 'r') as f:
+                    db_config = yaml.safe_load(f)
+                
+                if not db_config:
+                    print_warning(f"Empty or invalid config in {yaml_file.name}")
+                    continue
+                
+                database_name = db_config.get('databaseName', '').strip()
+                db_type = db_config.get('type', '').strip().upper()
+                
+                if not database_name:
+                    print_warning(f"No databaseName found in {yaml_file.name}")
+                    continue
+                
+                if not db_type:
+                    print_warning(f"No type found in {yaml_file.name}")
+                    continue
+                
+                # Skip if we've already seen this database name (use first occurrence only)
+                if database_name in seen_database_names:
+                    print_info(f"Skipping duplicate database '{database_name}' from {project_dir.name}/{yaml_file.name} (already configured)")
+                    continue
+                
+                seen_database_names.add(database_name)
+                
+                db_info = {
+                    'name': database_name,
+                    'type': db_type,
+                    'file': yaml_file.name,
+                    'project': project_dir.name
+                }
+                
+                databases_created.append(db_info)
+            
+            except Exception as e:
+                print_error(f"Failed to process {yaml_file.name}: {e}")
+    
+    if databases_created:
+        print_success(f"Found {len(databases_created)} database configuration(s)")
+        for db_info in databases_created:
+            print(f"  - {db_info['type']}: {db_info['name']} (from {db_info['project']}/{db_info['file']})")
+    else:
+        print_info("No database configurations found")
+    
+    return databases_created
+
+def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose_file: Optional[Path] = None, use_swarm: bool = False, database_configs: List[Dict] = None):
     """Create or update docker-compose.yml file for all projects."""
     # Load existing compose file if it exists
     existing_services = {}
@@ -631,7 +703,7 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
     existing_volumes = {}
     
     # Infrastructure services to preserve (not Minecraft game services)
-    infrastructure_services = {'mongodb', 'kafka', 'kafka-ui', 'zookeeper', 'velocity'}
+    infrastructure_services = {'mongodb','kafka', 'kafka-ui', 'zookeeper', 'velocity'}
     
     if base_compose_file and base_compose_file.exists():
         with open(base_compose_file, 'r') as f:
@@ -894,6 +966,155 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
     else:
         print_info("Geyser-Velocity already exists, skipping download")
     
+    def get_mongo_port(db_name: str) -> int:
+        """Get predictable port for MongoDB database based on name hash."""
+        import hashlib
+        # Use hash to get consistent port: 27018 + (hash % 100) = ports 27018-27117
+        hash_val = int(hashlib.md5(db_name.encode()).hexdigest(), 16)
+        return 27018 + (hash_val % 100)
+    
+    def get_postgres_port(db_name: str) -> int:
+        """Get predictable port for PostgreSQL database based on name hash."""
+        import hashlib
+        # Use hash to get consistent port: 5433 + (hash % 100) = ports 5433-5532
+        hash_val = int(hashlib.md5(db_name.encode()).hexdigest(), 16)
+        return 5433 + (hash_val % 100)
+    
+    def get_mysql_port(db_name: str) -> int:
+        """Get predictable port for MySQL database based on name hash."""
+        import hashlib
+        # Use hash to get consistent port: 3307 + (hash % 100) = ports 3307-3406
+        hash_val = int(hashlib.md5(db_name.encode()).hexdigest(), 16)
+        return 3307 + (hash_val % 100)
+    
+    # Create database services based on database names from configs
+    mongo_dbs = [db for db in database_configs if db.get('type') == 'MONGO'] if database_configs else []
+    for db_config in mongo_dbs:
+        db_name = db_config['name']
+        service_name = f'mongo-{db_name}'
+        mongo_port = get_mongo_port(db_name)
+        if service_name not in existing_services:
+            existing_services[service_name] = {
+                'image': 'mongo:7.0',
+                'ports': [
+                    {'target': 27017, 'published': mongo_port, 'protocol': 'tcp', 'mode': 'ingress'}
+                ],
+                'environment': {
+                    'MONGO_INITDB_ROOT_USERNAME': DB_USERNAME,
+                    'MONGO_INITDB_ROOT_PASSWORD': DB_PASSWORD,
+                    'MONGO_INITDB_DATABASE': db_name
+                },
+                'volumes': [
+                    {'type': 'volume', 'source': f'mongodb_data_{db_name}', 'target': '/data/db'}
+                ],
+                'healthcheck': {
+                    'test': ['CMD', 'mongosh', '--eval', "db.adminCommand('ping')"],
+                    'interval': '10s',
+                    'timeout': '5s',
+                    'retries': 5
+                },
+                'networks': ['local-docker-network'],
+                'deploy': {
+                    'replicas': 1,
+                    'restart_policy': {
+                        'condition': 'on-failure',
+                        'delay': '5s',
+                        'max_attempts': 3
+                    }
+                },
+                'labels': {
+                    'com.plexverse.service': 'mongodb',
+                    'com.plexverse.database.name': db_name
+                }
+            }
+            print_info(f"Added MongoDB service: {service_name} on port {mongo_port}")
+            mongo_port += 1
+    
+    # Add PostgreSQL services for each database
+    postgres_dbs = [db for db in database_configs if db.get('type') in ['POSTGRES', 'POSTGRESQL']] if database_configs else []
+    for db_config in postgres_dbs:
+        db_name = db_config['name']
+        service_name = f'postgres-{db_name}'
+        postgres_port = get_postgres_port(db_name)
+        if service_name not in existing_services:
+            existing_services[service_name] = {
+            'image': 'postgres:16',
+            'ports': [
+                {'target': 5432, 'published': postgres_port, 'protocol': 'tcp', 'mode': 'ingress'}
+            ],
+            'environment': {
+                'POSTGRES_USER': DB_USERNAME,
+                'POSTGRES_PASSWORD': DB_PASSWORD,
+                'POSTGRES_DB': db_name
+            },
+            'volumes': [
+                {'type': 'volume', 'source': f'postgres_data_{db_name}', 'target': '/var/lib/postgresql/data'}
+            ],
+            'healthcheck': {
+                'test': ['CMD-SHELL', 'pg_isready -U ' + DB_USERNAME],
+                'interval': '10s',
+                'timeout': '5s',
+                'retries': 5
+            },
+            'networks': ['local-docker-network'],
+            'deploy': {
+                'replicas': 1,
+                'restart_policy': {
+                    'condition': 'on-failure',
+                    'delay': '5s',
+                    'max_attempts': 3
+                }
+            },
+                'labels': {
+                    'com.plexverse.service': 'postgresql',
+                    'com.plexverse.database.name': db_name
+                }
+            }
+            print_info(f"Added PostgreSQL service: {service_name} on port {postgres_port}")
+    
+    # Add MySQL services for each database
+    mysql_dbs = [db for db in database_configs if db.get('type') == 'MYSQL'] if database_configs else []
+    for db_config in mysql_dbs:
+        db_name = db_config['name']
+        service_name = f'mysql-{db_name}'
+        mysql_port = get_mysql_port(db_name)
+        if service_name not in existing_services:
+            existing_services[service_name] = {
+                'image': 'mysql:8.0',
+                'ports': [
+                    {'target': 3306, 'published': mysql_port, 'protocol': 'tcp', 'mode': 'ingress'}
+                ],
+            'environment': {
+                'MYSQL_ROOT_PASSWORD': DB_PASSWORD,
+                'MYSQL_USER': DB_USERNAME,
+                'MYSQL_PASSWORD': DB_PASSWORD,
+                'MYSQL_DATABASE': db_name
+            },
+            'volumes': [
+                {'type': 'volume', 'source': f'mysql_data_{db_name}', 'target': '/var/lib/mysql'}
+            ],
+            'healthcheck': {
+                'test': ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-u', DB_USERNAME, '-p' + DB_PASSWORD],
+                'interval': '10s',
+                'timeout': '5s',
+                'retries': 5
+            },
+            'networks': ['local-docker-network'],
+            'deploy': {
+                'replicas': 1,
+                'restart_policy': {
+                    'condition': 'on-failure',
+                    'delay': '5s',
+                    'max_attempts': 3
+                }
+            },
+            'labels': {
+                'com.plexverse.service': 'mysql',
+                'com.plexverse.database.name': db_name
+            }
+        }
+        print_info(f"Added MySQL service: {service_name} on port {mysql_port}")
+    
     # Ensure velocity service exists (create if it doesn't)
     if 'velocity' not in existing_services:
         existing_services['velocity'] = {
@@ -944,8 +1165,22 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
         'networks': existing_networks
     }
     
+    # Set up volumes
     if existing_volumes:
         compose_data['volumes'] = existing_volumes
+    else:
+        compose_data['volumes'] = {}
+    
+    # Ensure required volumes exist for database services
+    for db_config in mongo_dbs:
+        db_name = db_config['name']
+        compose_data['volumes'][f'mongodb_data_{db_name}'] = None
+    for db_config in postgres_dbs:
+        db_name = db_config['name']
+        compose_data['volumes'][f'postgres_data_{db_name}'] = None
+    for db_config in mysql_dbs:
+        db_name = db_config['name']
+        compose_data['volumes'][f'mysql_data_{db_name}'] = None
     
     with open(compose_file, 'w') as f:
         yaml.dump(compose_data, f, default_flow_style=False, sort_keys=False)
@@ -953,84 +1188,78 @@ def create_docker_compose(projects: List[Dict], compose_file: Path, base_compose
     print_success(f"Created/updated docker-compose.yml with {len(projects)} Minecraft service(s)")
 
 def main():
-    # Ask if user wants to use a local local-engine JAR
-    print(f"{Colors.BLUE}Use local engine-bridge JAR? (leave empty to use from build/libs or download):{Colors.NC}")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Build Minecraft Docker images for game projects')
+    parser.add_argument('--engine-jar', type=str, help='Path to local engine-bridge JAR file')
+    parser.add_argument('--velocity-plugin', type=str, help='Path to local velocity plugin JAR file')
+    parser.add_argument('projects', nargs='*', help='Project paths to build')
+    args = parser.parse_args()
+    
+    # Handle engine-bridge JAR
     local_jar_path = None
-    try:
-        local_path_input = input("  Local JAR path: ").strip()
-        if local_path_input:
-            local_jar_path = Path(local_path_input).expanduser().resolve()
-            if not local_jar_path.exists():
-                print_error(f"Local JAR path does not exist: {local_jar_path}")
-                sys.exit(1)
-            if not local_jar_path.is_file():
-                print_error(f"Local path is not a file: {local_jar_path}")
-                sys.exit(1)
-            if not local_jar_path.name.lower().endswith('.jar'):
-                print_warning(f"File does not have .jar extension: {local_jar_path}")
-                response = input("  Continue anyway? (y/N): ").strip().lower()
-                if response != 'y':
-                    sys.exit(1)
-            print_success(f"Using local JAR: {local_jar_path}")
-            # Store in function attribute for use in build_project_image
-            build_project_image._use_local_jar = True
-            build_project_image._local_jar_path = str(local_jar_path)
-        else:
-            print_info("Will download latest release from GitHub")
-            build_project_image._use_local_jar = False
-            build_project_image._local_jar_path = None
-    except (EOFError, KeyboardInterrupt):
-        print_error("\nCancelled")
-        sys.exit(1)
+    if args.engine_jar:
+        local_jar_path = Path(args.engine_jar).expanduser().resolve()
+        if not local_jar_path.exists():
+            print_error(f"Local JAR path does not exist: {local_jar_path}")
+            sys.exit(1)
+        if not local_jar_path.is_file():
+            print_error(f"Local path is not a file: {local_jar_path}")
+            sys.exit(1)
+        if not local_jar_path.name.lower().endswith('.jar'):
+            print_error(f"File does not have .jar extension: {local_jar_path}")
+            sys.exit(1)
+        print_success(f"Using local JAR: {local_jar_path}")
+        build_project_image._use_local_jar = True
+        build_project_image._local_jar_path = str(local_jar_path)
+    else:
+        print_info("Will use engine-bridge from build/libs or download from GitHub")
+        build_project_image._use_local_jar = False
+        build_project_image._local_jar_path = None
     
-    # Ask if user wants to use a local velocity plugin JAR
-    print(f"\n{Colors.BLUE}Use local velocity plugin JAR? (leave empty to download from GitHub):{Colors.NC}")
+    # Handle velocity plugin JAR
     local_velocity_plugin_path = None
-    try:
-        local_plugin_input = input("  Local plugin JAR path: ").strip()
-        if local_plugin_input:
-            local_velocity_plugin_path = Path(local_plugin_input).expanduser().resolve()
-            if not local_velocity_plugin_path.exists():
-                print_error(f"Local plugin path does not exist: {local_velocity_plugin_path}")
-                sys.exit(1)
-            if not local_velocity_plugin_path.is_file():
-                print_error(f"Local path is not a file: {local_velocity_plugin_path}")
-                sys.exit(1)
-            if not local_velocity_plugin_path.name.lower().endswith('.jar'):
-                print_warning(f"File does not have .jar extension: {local_velocity_plugin_path}")
-                response = input("  Continue anyway? (y/N): ").strip().lower()
-                if response != 'y':
-                    sys.exit(1)
-            print_success(f"Using local Velocity plugin: {local_velocity_plugin_path}")
-            # Store in function attribute for use in create_docker_compose
-            create_docker_compose._use_local_velocity_plugin = True
-            create_docker_compose._local_velocity_plugin_path = str(local_velocity_plugin_path)
-        else:
-            print_info("Will download latest release from GitHub")
-            create_docker_compose._use_local_velocity_plugin = False
-            create_docker_compose._local_velocity_plugin_path = None
-    except (EOFError, KeyboardInterrupt):
-        print_error("\nCancelled")
-        sys.exit(1)
+    if args.velocity_plugin:
+        local_velocity_plugin_path = Path(args.velocity_plugin).expanduser().resolve()
+        if not local_velocity_plugin_path.exists():
+            print_error(f"Local plugin path does not exist: {local_velocity_plugin_path}")
+            sys.exit(1)
+        if not local_velocity_plugin_path.is_file():
+            print_error(f"Local path is not a file: {local_velocity_plugin_path}")
+            sys.exit(1)
+        if not local_velocity_plugin_path.name.lower().endswith('.jar'):
+            print_error(f"File does not have .jar extension: {local_velocity_plugin_path}")
+            sys.exit(1)
+        print_success(f"Using local Velocity plugin: {local_velocity_plugin_path}")
+        create_docker_compose._use_local_velocity_plugin = True
+        create_docker_compose._local_velocity_plugin_path = str(local_velocity_plugin_path)
+    else:
+        print_info("Will download latest Velocity plugin from GitHub")
+        create_docker_compose._use_local_velocity_plugin = False
+        create_docker_compose._local_velocity_plugin_path = None
     
-    # Prompt for project paths interactively
-    print(f"\n{Colors.BLUE}Enter project paths (one per line, empty line to finish):{Colors.NC}")
+    # Get project paths from arguments or prompt interactively
     project_paths = []
-    
-    while True:
-        try:
-            path = input(f"  Project {len(project_paths) + 1}: ").strip()
-            if not path:
+    if args.projects:
+        project_paths = args.projects
+        print_info(f"Using project paths from arguments: {project_paths}")
+    else:
+        # Prompt for project paths interactively
+        print(f"\n{Colors.BLUE}Enter project paths (one per line, empty line to finish):{Colors.NC}")
+        while True:
+            try:
+                path = input(f"  Project {len(project_paths) + 1}: ").strip()
+                if not path:
+                    if len(project_paths) == 0:
+                        print_error("At least one project path is required")
+                        continue
+                    break
+                project_paths.append(path)
+            except (EOFError, KeyboardInterrupt):
                 if len(project_paths) == 0:
-                    print_error("At least one project path is required")
-                    continue
+                    print_error("\nNo project paths provided")
+                    sys.exit(1)
                 break
-            project_paths.append(path)
-        except (EOFError, KeyboardInterrupt):
-            if len(project_paths) == 0:
-                print_error("\nNo project paths provided")
-                sys.exit(1)
-            break
     
     if not project_paths:
         print_error("No project paths provided")
@@ -1064,6 +1293,10 @@ def main():
         sys.exit(1)
     
     print_success(f"Successfully built {len(results)} project(s)")
+    
+    # Create databases from config/databases YAML files
+    print_info("Creating databases from configuration files...")
+    database_configs = create_databases_from_configs(project_paths)
     
     # Prompt for environment variables for each project
     for project in results:
@@ -1110,7 +1343,7 @@ def main():
     script_dir = Path(__file__).parent.parent
     base_compose_file = script_dir / "docker-compose.yml"
     compose_file = script_dir / "docker-compose.yml"
-    create_docker_compose(results, compose_file, base_compose_file, use_swarm)
+    create_docker_compose(results, compose_file, base_compose_file, use_swarm, database_configs)
     
     # Save project paths mapping for rebuild script
     project_paths_file = script_dir / ".project-paths.json"
