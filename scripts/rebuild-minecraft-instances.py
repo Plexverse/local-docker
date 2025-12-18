@@ -128,7 +128,14 @@ def rebuild_image(service_info: dict, project_path: str, script_dir: Path):
         print_warning(f"Please run the full build script: python3 scripts/build-minecraft-images.py")
         return False
     
-    project_path_obj = Path(project_path).expanduser().resolve()
+    # Resolve relative paths relative to the script's parent directory (workspace root)
+    project_path_obj = Path(project_path).expanduser()
+    if not project_path_obj.is_absolute():
+        # Resolve relative to script's parent directory (local-docker, which is workspace root)
+        project_path_obj = (script_dir / project_path).resolve()
+    else:
+        project_path_obj = project_path_obj.resolve()
+    
     if not project_path_obj.exists():
         print_error(f"Project path does not exist: {project_path_obj}")
         return False
